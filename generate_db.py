@@ -63,6 +63,13 @@ def main(base_dir):
         # Vocal Harmonies
         has_vocal_harmonies = get_diff("diff_vocals_harm") > -1
 
+        # Tuning checks
+        has_guitar_tuning = "real_guitar_tuning" in ini_data
+        has_bass_tuning = "real_bass_tuning" in ini_data
+
+        guitar_tuning_offset = ini_data.get("real_guitar_tuning", "0 0 0 0 0 0")
+        bass_tuning_offset = ini_data.get("real_bass_tuning", "0 0 0 0")
+
         row = {
             "Folder Name": folder_name,
             "Song Name": ini_data.get("name", "Unknown"),
@@ -88,6 +95,11 @@ def main(base_dir):
             "Has Pro Keys": has_pro_keys,
             "Has Pro Drums": has_pro_drums,
             "Has Vocal Harmonies": has_vocal_harmonies,
+            # Tuning Indicators & Offsets
+            "Has Guitar Tuning": has_guitar_tuning,
+            "Guitar Tuning Offset": guitar_tuning_offset,
+            "Has Bass Tuning": has_bass_tuning,
+            "Bass Tuning Offset": bass_tuning_offset,
             # Audio files list
             "Audio Tracks": ", ".join(sorted(audio_files))
         }
