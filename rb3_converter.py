@@ -8,12 +8,6 @@ from rb_parser import parse_midi_file
 
 
 def parse_tuning(value, default):
-    # song.ini stores Pro Guitar/Bass tuning as semitone offsets from
-    # standard tuning (e.g. "real_guitar_tuning = 0,0,0,0,0,-1" for a
-    # dropped low string). Different authoring tools export this a few
-    # different ways - comma-separated, space-separated, sometimes wrapped
-    # in quotes - so this accepts all of them rather than silently falling
-    # back to standard tuning the moment the format doesn't match exactly.
     if not value:
         return default
     value = value.strip().strip('"').strip("'").strip()
@@ -25,7 +19,7 @@ def parse_tuning(value, default):
         try:
             offsets.append(int(tok))
         except ValueError:
-            continue  # skip a stray non-numeric token rather than discarding the whole field
+            continue
     return offsets if offsets else default
 
 
@@ -81,14 +75,6 @@ def convert_to_feedpak(song_folder, output_folder):
             "type": "piano",
             "notation": "arrangements/notation_keys.json"
         }
-        # notation_keys.json alone is a supplementary staff-notation view
-        # (spec §7.6) - it's NOT what a Reader scores/counts notes from.
-        # keys_pro_wire.json is the actual §6 wire-format chart (piano
-        # pitches encoded as base-24 string/fret pairs); it maps to
-        # arrangements/keys.json in the archive at zip time below. Without
-        # this 'file' pointer the arrangement shows up as playable with 0
-        # notes on readers that don't treat notation-only as a scoreable
-        # chart.
         if 'keys_pro_wire.json' in generated_jsons:
             keys_entry["file"] = "arrangements/keys.json"
         arrangements.append(keys_entry)
@@ -174,10 +160,6 @@ def convert_to_feedpak(song_folder, output_folder):
             if json_file in ['combo.json', 'bass.json', 'notation_keys.json']:
                 zipf.write(full_json_path, f"arrangements/{json_file}")
             elif json_file == 'keys_pro_wire.json':
-                # Temp name on disk only, to avoid colliding with the
-                # unrelated song-level keys.json (§7.7 key/scale
-                # annotations) during generation. Its real archive path
-                # matches the arrangement entry's 'file' pointer above.
                 zipf.write(full_json_path, "arrangements/keys.json")
             else:
                 zipf.write(full_json_path, json_file)

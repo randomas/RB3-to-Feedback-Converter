@@ -3,6 +3,7 @@ import json
 import os
 import re
 import math
+from collections import Counter
 
 def build_tempo_map(mid):
     tempo_events = []
@@ -89,11 +90,6 @@ def get_tempo_bpm_at_tick(tick, tempo_map):
 ALLOWED_NOTE_VALUES = [1, 2, 4, 8, 16, 32]
 
 def seconds_to_note_value(duration_seconds, bpm):
-    # notation_keys.json's "dur" is a rhythmic note-value denominator
-    # (1=whole, 2=half, 4=quarter, 8=eighth, 16=sixteenth, 32=32nd) - NOT a
-    # duration in seconds. A quarter note = one beat, so convert the note's
-    # real duration into "how many quarter notes long is this at the
-    # tempo in effect", then snap to the nearest valid denominator.
     if duration_seconds <= 0 or bpm <= 0:
         return 32
     quarter_note_seconds = 60.0 / bpm
@@ -105,7 +101,6 @@ def seconds_to_note_value(duration_seconds, bpm):
 
 
 def build_measure_boundaries(ts_map, ticks_per_beat, end_tick):
-    # Returns [(start_tick, num, den), ...] covering 0..end_tick.
     measures = []
     current_tick = 0
     ts_idx = 0
@@ -122,6 +117,83 @@ def build_measure_boundaries(ts_map, ticks_per_beat, end_tick):
     return measures
 
 
+# --- ANCHOR COMPUTATION FOR PRO GUITAR / BASS ---
+def compute_anchors(notes, window_seconds=2.0):
+    """
+    Computes hand-position anchors purely from played note data - there's no
+    reliable native MIDI marker for this (see notes in parse_pro_guitar_track).
+    Chords anchor at their lowest fret, with width spanning the full chord
+    shape. Single-note runs anchor at the most prevalent non-open fret within
+    the window (ties go to the lower fret); stray outlier notes (e.g. one
+    reach up the neck) are excluded from the width so they don't blow out
+    the zoom box for the whole window.
+    """
+    fretted = [n for n in notes if n['f'] > 0]
+
+    if not fretted:
+        return [{"time": 0.0, "fret": 1, "width": 4}]
+
+    grouped_notes = {}
+    for n in fretted:
+        grouped_notes.setdefault(n['t'], []).append(n)
+
+    timestamps = sorted(grouped_notes.keys())
+    anchors = []
+
+    last_fret = None
+    last_width = None
+
+    start_idx = 0
+    while start_idx < len(timestamps):
+        window_start = timestamps[start_idx]
+        window_end = window_start + window_seconds
+
+        window_frets = []
+        chord_found = False
+        chord_lowest_fret = None
+        chord_highest_fret = None
+
+        end_idx = start_idx
+        while end_idx < len(timestamps) and timestamps[end_idx] <= window_end:
+            t = timestamps[end_idx]
+            simultaneous_notes = grouped_notes[t]
+
+            if len(simultaneous_notes) > 1:
+                chord_found = True
+                chord_lowest_fret = min(n['f'] for n in simultaneous_notes)
+                chord_highest_fret = max(n['f'] for n in simultaneous_notes)
+                break
+
+            window_frets.append(simultaneous_notes[0]['f'])
+            end_idx += 1
+
+        if chord_found:
+            target_fret = chord_lowest_fret
+            target_width = max(4, chord_highest_fret - chord_lowest_fret + 1)
+            start_idx = end_idx + 1
+        else:
+            counts = Counter(window_frets)
+            top_count = counts.most_common(1)[0][1]
+            # tie-break toward the lowest fret among equally-common candidates
+            target_fret = min(f for f, c in counts.items() if c == top_count)
+            # discard stray outlier frets (a single reach far from the
+            # prevalent position) before sizing the zoom box
+            close_frets = [f for f in window_frets if abs(f - target_fret) <= 4]
+            target_width = max(4, max(close_frets) - min(close_frets) + 1) if close_frets else 4
+            start_idx = end_idx
+
+        if target_fret != last_fret or target_width != last_width:
+            anchors.append({
+                "time": window_start,
+                "fret": target_fret,
+                "width": target_width
+            })
+            last_fret = target_fret
+            last_width = target_width
+
+    return anchors if anchors else [{"time": 0.0, "fret": 1, "width": 4}]
+
+
 # --- 1. PRO GUITAR / BASS PARSER (EXPERT-TIER STRING NOTE + VELOCITY FRET) ---
 def parse_pro_guitar_track(track, tempo_map, ticks_per_beat, is_bass=False):
     active_notes = {}
@@ -129,31 +201,19 @@ def parse_pro_guitar_track(track, tempo_map, ticks_per_beat, is_bass=False):
     current_ticks = 0
     max_strings = 4 if is_bass else 6
 
-    # RB3 Pro Guitar/Bass encoding: four difficulty tiers stacked in pitch
-    # (Easy=24, Medium=48, Hard=72, Expert=96). Within a tier, each of the
-    # max_strings consecutive notes represents one STRING, not a fret.
-    # The FRET is carried in the note_on velocity (velocity 100 = open/fret 0).
-    # We only want the full-fidelity Expert tier for the real transcription.
     EXPERT_BASE = 96
-    # note offset within the tier maps directly to string index: offset 0
-    # (the lowest note in the tier) is the lowest-pitched string (e.g. low E
-    # on guitar / low E on bass), offset max_strings-1 is the highest-pitched
-    # string (high E on guitar / G on bass).
 
     for msg in track:
         current_ticks += msg.time
 
         if msg.type in ['note_on', 'note_off']:
+            abs_time = ticks_to_seconds(current_ticks, tempo_map, ticks_per_beat)
+            # --- Playable Note Parsing ---
             offset = msg.note - EXPERT_BASE
             if not (0 <= offset < max_strings):
-                # Not an Expert-tier string note: either a lower-difficulty
-                # duplicate (24/48/72 tiers) or a track-wide modifier note
-                # (slide, trill, overdrive, etc.) - not fret/string data.
                 continue
 
             string_idx = offset  # 0-based, 0 = lowest-pitched string
-
-            abs_time = ticks_to_seconds(current_ticks, tempo_map, ticks_per_beat)
             note_key = msg.note
 
             if msg.type == 'note_on' and msg.velocity > 0:
@@ -190,38 +250,32 @@ def parse_pro_guitar_track(track, tempo_map, ticks_per_beat, is_bass=False):
 
     final_notes.sort(key=lambda x: (x['t'], x['s']))
 
+    # Anchors are always computed dynamically from the played notes - there's
+    # no reliable native MIDI marker for hand position. An earlier version of
+    # this treated notes 108-129 as fret-position markers, but checking that
+    # against a real chart showed it doesn't hold up: that range only covers
+    # ~14% of note onsets, hits both single notes and chords indiscriminately,
+    # and its values don't correlate with the fret actually being played -
+    # it's very likely carrying some other per-passage flag (palm mute is
+    # the best current guess) rather than position data. See compute_anchors().
+    anchors = compute_anchors(final_notes)
+
     return {
         "name": "Bass" if is_bass else "Combo",
         "tuning": [0] * max_strings,
         "capo": 0,
         "notes": final_notes,
         "chords": [],
-        "anchors": [{"time": 0.0, "fret": 1, "width": 4}],
+        "anchors": anchors,
+        # No "handPositions" field - not part of the spec (§6.1's top-level
+        # shape doesn't include it). Anchors are the hand-position mechanism
+        # per §6.4 ("where the fretting hand sits; drives a renderer's
+        # zoom/focus box").
         "handshapes": [],
         "templates": []
     }
 
 
-# --- 2. KEYS PARSER ---
-# PART REAL_KEYS_X (Expert) is NOT encoded like guitar/bass - it carries the
-# actual piano pitches directly (e.g. note 60 = middle C). The only notes to
-# filter out are: very low "range shift" indicator notes (RB3 uses these,
-# roughly 0-9, to show which octave range is active on-screen - they aren't
-# played pitches), and the overdrive flag note (116, same value as
-# guitar/bass). A sane real piano range (21-108, the full 88-key range)
-# excludes both automatically.
-#
-# notation_keys.json expects "dur" to be a rhythmic note-value denominator
-# (1/2/4/8/16/32), not a duration in seconds, and expects notes grouped into
-# real measures (by time signature), not one giant measure holding the whole
-# song. Both are handled via the tempo/time-signature maps passed in.
-#
-# NOTE: we don't attempt to detect a pickup (partial) first measure, so we
-# never emit idx: 0 - the spec RESERVES 0 exclusively for a true pickup
-# measure and requires it to also carry pickup: true. Measures are numbered
-# from 1 like any ordinary bar; notes still land at the correct absolute
-# time either way, it's only the bar *number* that may not match a DAW's
-# count if the real chart opens with a pickup.
 # --- 2. KEYS PARSER ---
 def parse_keys_track(track, tempo_map, ticks_per_beat, ts_map):
     active_notes = {}
@@ -238,14 +292,11 @@ def parse_keys_track(track, tempo_map, ticks_per_beat, ts_map):
 
         abs_time = ticks_to_seconds(current_ticks, tempo_map, ticks_per_beat)
 
-        # Range-shift markers (roughly notes 0-11) tell RB3's on-screen
-        # keyboard which octave to display - not a played pitch, and not
-        # part of feedpak's notation_<id>.json schema. Skip them.
         if 0 <= msg.note <= 11:
             continue
 
         if not (MIN_PIANO_NOTE <= msg.note <= MAX_PIANO_NOTE):
-            continue  # ignore overdrive flags, etc.
+            continue
 
         if msg.type == 'note_on' and msg.velocity > 0:
             active_notes.setdefault(msg.note, []).append((current_ticks, abs_time))
@@ -259,13 +310,12 @@ def parse_keys_track(track, tempo_map, ticks_per_beat, ts_map):
                     "tick": start_tick,
                     "t": start_time,
                     "midi": msg.note,
-                    "dur_value": note_value,       # rhythmic denominator, for notation
-                    "dur_seconds": dur_seconds      # real sustain, for the wire-format "sus"
+                    "dur_value": note_value,
+                    "dur_seconds": dur_seconds
                 })
 
     raw_notes.sort(key=lambda n: (n["tick"], n["midi"]))
 
-    # --- notation_keys.json (§7.6 staff notation - supplementary display) ---
     if not raw_notes:
         measures = [{
             "idx": 1,
@@ -287,13 +337,9 @@ def parse_keys_track(track, tempo_map, ticks_per_beat, ts_map):
                 {"t": n["t"], "dur": n["dur_value"], "notes": [{"midi": n["midi"]}]}
                 for n in raw_notes if start_tick <= n["tick"] < end_tick
             ]
-            # Do not skip measures with no notes - idx must stay contiguous
-            # (1, 2, 3, ...) all the way through, matching how a known-good
-            # reference file for this schema numbers bars, even ones where
-            # nothing plays.
 
             measure = {
-                "idx": m_idx + 1,  # measures are 1-based; 0 is reserved for a real pickup bar
+                "idx": m_idx + 1,
                 "t": ticks_to_seconds(start_tick, tempo_map, ticks_per_beat),
                 "staves": {"rh": {"voices": [{"v": 1, "beats": measure_beats}]}}
             }
@@ -313,18 +359,6 @@ def parse_keys_track(track, tempo_map, ticks_per_beat, ts_map):
         "measures": measures
     }
 
-    # --- arrangements/keys.json (§6 guitar wire format - the actual scored
-    # chart). notation_<id>.json (above) is explicitly a supplementary
-    # staff-notation view (§7.6): "separate from the guitar wire format".
-    # The wire format is what a Reader counts/scores notes from, so an
-    # arrangement with only `notation` and no `file` shows up as playable
-    # with 0 notes on readers that don't treat notation-only as a scoreable
-    # chart. Piano pitches don't have real strings/frets, so - matching a
-    # known-good reference pack for this exact engine - we split each raw
-    # MIDI note into a base-24 (string, fret) pair: s = midi // 24,
-    # f = midi % 24 (each "string" is a 2-octave block, fret runs 0-23
-    # within it). This isn't part of the written spec; it's a convention
-    # this reference pack uses and we're matching it for compatibility.
     wire_notes = [
         {
             "t": n["t"],
@@ -349,13 +383,7 @@ def parse_keys_track(track, tempo_map, ticks_per_beat, ts_map):
     return notation_json, keys_wire_json
 
 
-
 # --- KEY/SCALE ANNOTATIONS (keys.json) ---
-# Derived from MIDI 'key_signature' meta messages, when present. Mido's key
-# strings already come out as e.g. "Em"/"G", matching the spec's "key" field
-# directly; a trailing "m" means minor. MIDI key signatures don't distinguish
-# natural/harmonic/melodic minor, so every minor key is reported as
-# "natural_minor" here - that's an assumption, not something the MIDI tells us.
 def parse_key_signature_events(mid, tempo_map, ticks_per_beat):
     events = []
     for track in mid.tracks:
@@ -372,7 +400,6 @@ def parse_key_signature_events(mid, tempo_map, ticks_per_beat):
                 })
 
     events.sort(key=lambda e: e["t"])
-    # de-dupe same-time repeats
     deduped = []
     for ev in events:
         if deduped and deduped[-1]["t"] == ev["t"]:
@@ -388,25 +415,15 @@ def parse_drums_track(track, tempo_map, ticks_per_beat):
     hits = []
     current_ticks = 0
 
-    # Kick and snare are unambiguous.
     simple_pad_mapping = {
-        96: "kick",   # Pedal
-        97: "snare",  # Red
+        96: "kick",
+        97: "snare",
     }
 
-    # Yellow/Blue/Green (98/99/100) are ambiguous on their own: RB3's
-    # "Pro Drums" charts overlay a separate sustained TOM MARKER note per
-    # lane (110=yellow, 111=blue, 112=green). The DEFAULT reading of a
-    # yellow/blue/green hit is a CYMBAL (hi-hat/ride/crash) - that's the
-    # common case in most charts. Only while the marker note is HELD (its
-    # own note_on..note_off span) does a hit on that lane mean a TOM
-    # instead. (Earlier version of this had the polarity backwards -
-    # treating marker-absent as tom - which silently turned nearly every
-    # cymbal hit into a tom for songs that don't lean heavily on toms.)
     tom_cymbal_pads = {
-        98: {"marker": 110, "cymbal": "hh_closed", "tom": "tom_hi"},    # Yellow
-        99: {"marker": 111, "cymbal": "ride",       "tom": "tom_mid"},  # Blue
-        100: {"marker": 112, "cymbal": "crash_r",   "tom": "tom_floor"},  # Green
+        98: {"marker": 110, "cymbal": "hh_closed", "tom": "tom_hi"},
+        99: {"marker": 111, "cymbal": "ride",       "tom": "tom_mid"},
+        100: {"marker": 112, "cymbal": "crash_r",   "tom": "tom_floor"},
     }
     marker_to_pad_note = {info["marker"]: pad_note for pad_note, info in tom_cymbal_pads.items()}
 
@@ -425,8 +442,6 @@ def parse_drums_track(track, tempo_map, ticks_per_beat):
 
         note_off_event = (msg.type == 'note_off') or (msg.type == 'note_on' and msg.velocity == 0)
 
-        # Track tom-marker on/off spans first, so a hit on the same tick
-        # as a marker toggle sees the up-to-date state.
         if msg.note in marker_to_pad_note:
             pad_note = marker_to_pad_note[msg.note]
             tom_marker_active[pad_note] = not note_off_event
@@ -602,19 +617,6 @@ def parse_midi_file(midi_path, output_folder):
             arrangements['bass'] = parse_pro_guitar_track(track, tempo_map, ticks_per_beat, is_bass=True)
 
         elif t_name == 'PART REAL_KEYS_X':
-            # Expert real-keys only. 'KEYS' alone would also match PART KEYS
-            # (the simplified 5-lane chart), REAL_KEYS_H/M/E (lower
-            # difficulties), and KEYS_ANIM_RH/LH (finger-animation data,
-            # not notes at all) - all of which would silently overwrite
-            # this if matched later in track order.
-            #
-            # notation_keys.json is the supplementary staff-notation view;
-            # the wire-format file is the actual scored/playable chart (see
-            # parse_keys_track's docstring). It's generated under a temp
-            # name here - keys_pro_wire.json - specifically so it can never
-            # collide with the unrelated song-level keys.json (§7.7
-            # key/scale annotations) before main.py maps it to its real
-            # archive path, arrangements/keys.json.
             notation_json, keys_wire_json = parse_keys_track(track, tempo_map, ticks_per_beat, ts_map)
             extra_files['notation_keys.json'] = notation_json
             extra_files['keys_pro_wire.json'] = keys_wire_json
