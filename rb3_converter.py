@@ -44,38 +44,70 @@ def parse_tuning_strict(value):
 def resolve_tuning(rb3_tuning_str, songsterr_tuning_str, default):
     """
     Reconciles the RB3-declared tuning against a Songsterr-sourced tuning
-    for the same instrument. Returns (tuning, needs_check):
+    for the same instrument. Returns (tuning, needs_check, string_mismatch):
       - No usable Songsterr value -> fall back to the RB3 tuning (or
-        default), never flagged - there's nothing to disagree with.
-      - Songsterr present but RB3 tuning missing, or the two have a
-        different number of strings (e.g. a 7-string chart Songsterr knows
-        about that the RB3 .ini only ever declared 6 strings for) -> can't
-        meaningfully compare, so trust Songsterr as-is, not flagged.
+        default), neither flag set - there's nothing to disagree with.
+      - Songsterr present but RB3 tuning missing -> can't compare, trust
+        Songsterr as-is, neither flag set.
+      - Both present but with a different number of strings (e.g. Songsterr
+        shows a 5-string bass where RB3 only ever declared 4) -> can't
+        meaningfully diff them string-by-string, so trust Songsterr as-is,
+        but set string_mismatch so this can be flagged/reviewed separately
+        from an actual tuning disagreement.
       - Both present, same length, and the per-string difference is
         constant across every string (including all-zero, i.e. identical)
         -> they're the same tuning (or a uniform transposition of it) ->
-        use Songsterr, not flagged.
+        use Songsterr, neither flag set.
       - Both present, same length, but the per-string difference is NOT
-        constant -> genuinely conflicting tunings -> use Songsterr, but
-        flag it for a human to double check.
+        constant -> genuinely conflicting tunings -> use Songsterr, and set
+        needs_check.
     """
     rb3 = parse_tuning_strict(rb3_tuning_str)
     songsterr = parse_tuning_strict(songsterr_tuning_str)
 
     if songsterr is None:
-        return (rb3 if rb3 is not None else default), False
+        return (rb3 if rb3 is not None else default), False, False
 
-    if rb3 is None or len(rb3) != len(songsterr):
-        return songsterr, False
+    if rb3 is None:
+        return songsterr, False, False
+
+    if len(rb3) != len(songsterr):
+        return songsterr, False, True
 
     diffs = [s - r for s, r in zip(songsterr, rb3)]
     needs_check = len(set(diffs)) > 1
-    return songsterr, needs_check
+    return songsterr, needs_check, False
+
+
+def load_tuning_lookup(csv_path):
+    """
+    Loads the Songsterr-cross-referenced tuning CSV (e.g.
+    rb3_songs_db_merged_with_tunings.csv) into a dict keyed by Folder Name,
+    for use as an optional cross-reference lookup table. Returns {} if the
+    file doesn't exist or doesn't have the expected tuning columns, so
+    callers can treat "no lookup available" and "lookup available but no
+    match for this song" the same way (both just skip the override).
+    """
+    import csv as csv_module
+
+    if not csv_path or not os.path.exists(csv_path):
+        return {}
+
+    lookup = {}
+    with open(csv_path, mode='r', encoding='utf-8-sig') as f:
+        reader = csv_module.DictReader(f)
+        if reader.fieldnames is None or 'Folder Name' not in reader.fieldnames:
+            return {}
+        for row in reader:
+            lookup[row['Folder Name']] = row
+
+    return lookup
 
 
 def convert_to_feedpak(song_folder, output_folder,
-                        guitar_tuning_override=None, guitar_tuning_check=False,
-                        bass_tuning_override=None, bass_tuning_check=False):
+                        guitar_tuning_override=None, guitar_tuning_check=False, guitar_string_mismatch=False,
+                        bass_tuning_override=None, bass_tuning_check=False, bass_string_mismatch=False,
+                        tuning_lookup=None):
     ini_path = os.path.join(song_folder, 'song.ini')
     if not os.path.exists(ini_path):
         print(f"Error: No song.ini found in {song_folder}")
@@ -99,6 +131,22 @@ def convert_to_feedpak(song_folder, output_folder,
     if os.path.exists(midi_path):
         print(" -> Parsing MIDI track data...")
         generated_jsons = parse_midi_file(midi_path, song_folder)
+
+    # If the caller didn't already resolve tuning explicitly (that's how
+    # Batch_convert.py does it, one CSV read for the whole run), fall back
+    # to looking this song up in the optional cross-reference table by its
+    # folder name - lets rb3_converter.py be run standalone against a
+    # single song folder while still getting the reconciled tuning.
+    if guitar_tuning_override is None and bass_tuning_override is None and tuning_lookup:
+        folder_name = os.path.basename(os.path.normpath(song_folder))
+        row = tuning_lookup.get(folder_name)
+        if row:
+            guitar_tuning_override, guitar_tuning_check, guitar_string_mismatch = resolve_tuning(
+                row.get('Guitar Tuning'), row.get('S.SterrGtuning'), None)
+            bass_tuning_override, bass_tuning_check, bass_string_mismatch = resolve_tuning(
+                row.get('Bass Tuning'), row.get('S.SterrBtuning'), None)
+        else:
+            print(f" -> No tuning cross-reference entry found for folder '{folder_name}'; using song.ini tuning.")
 
     guitar_tuning = guitar_tuning_override if guitar_tuning_override is not None \
         else parse_tuning(meta.get('real_guitar_tuning'), [0, 0, 0, 0, 0, 0])
@@ -165,8 +213,13 @@ def convert_to_feedpak(song_folder, output_folder,
     duration_ms = float(meta.get('song_length', 0))
 
     display_title = song_name
+    title_flags = []
     if guitar_tuning_check or bass_tuning_check:
-        display_title = f"{song_name} (check tuning)"
+        title_flags.append("(check tuning)")
+    if guitar_string_mismatch or bass_string_mismatch:
+        title_flags.append("(string count mismatch)")
+    if title_flags:
+        display_title = f"{song_name} " + " ".join(title_flags)
 
     manifest = {
         "feedpak_version": "1.19.0",
@@ -234,7 +287,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert Rock Band song folder to Feedpak format.")
     parser.add_argument("song_folder", help="Path to the input song folder containing song.ini and notes.mid")
     parser.add_argument("output_folder", help="Path to the directory where the generated .feedpak will be saved")
-    
+    parser.add_argument("--tuning-csv", default=None,
+                         help="Optional path to rb3_songs_db_merged_with_tunings.csv (or similar), used as a "
+                              "cross-reference lookup table for this song's tuning by folder name. Only used "
+                              "when provided; without it, tuning comes from song.ini as before.")
+
     args = parser.parse_args()
-    
-    convert_to_feedpak(args.song_folder, args.output_folder)
+
+    tuning_lookup = load_tuning_lookup(args.tuning_csv) if args.tuning_csv else None
+
+    convert_to_feedpak(args.song_folder, args.output_folder, tuning_lookup=tuning_lookup)

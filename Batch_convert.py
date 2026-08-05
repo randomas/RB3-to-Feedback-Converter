@@ -1,7 +1,7 @@
 import os
 import csv
 import argparse
-from rb3_converter import convert_to_feedpak, resolve_tuning
+from rb3_converter import convert_to_feedpak, resolve_tuning, load_tuning_lookup
 
 def parse_int(val):
     try:
@@ -9,7 +9,7 @@ def parse_int(val):
     except (ValueError, TypeError):
         return -1
 
-def batch_convert(csv_path, base_songs_dir, output_folder, dry_run=False):
+def batch_convert(csv_path, base_songs_dir, output_folder, dry_run=False, tuning_csv_path=None):
     if not os.path.exists(csv_path):
         print(f"Error: CSV file not found at {csv_path}")
         return
@@ -20,9 +20,10 @@ def batch_convert(csv_path, base_songs_dir, output_folder, dry_run=False):
     with open(csv_path, mode='r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         # The merged CSV (rb3_songs_db_merged_with_tunings.csv) has these
-        # extra columns; the plain rb3_songs_db.csv doesn't. Detect which
-        # one we were given so this still works with either.
-        has_tuning_columns = reader.fieldnames is not None and \
+        # extra columns; the plain rb3_songs_db.csv doesn't. If a separate
+        # --tuning-csv was given, that takes priority as the tuning source
+        # regardless of what columns csv_path itself has.
+        main_csv_has_tuning_columns = reader.fieldnames is not None and \
             'S.SterrGtuning' in reader.fieldnames and 'S.SterrBtuning' in reader.fieldnames
 
         for row in reader:
@@ -38,10 +39,18 @@ def batch_convert(csv_path, base_songs_dir, output_folder, dry_run=False):
 
     total_matches = len(filtered_rows)
 
-    if not has_tuning_columns:
-        print("Note: CSV has no Songsterr tuning columns (S.SterrGtuning/S.SterrBtuning) - "
-              "falling back to each song's own song.ini tuning. Point this at "
-              "rb3_songs_db_merged_with_tunings.csv to use the reconciled tunings.\n")
+    # Resolve where tuning cross-reference data comes from, if anywhere.
+    tuning_lookup = None
+    if tuning_csv_path:
+        tuning_lookup = load_tuning_lookup(tuning_csv_path)
+        if not tuning_lookup:
+            print(f"Warning: --tuning-csv '{tuning_csv_path}' not found or missing expected columns - "
+                  f"falling back to each song's own song.ini tuning.\n")
+    elif main_csv_has_tuning_columns:
+        tuning_lookup = {row['Folder Name']: row for row in filtered_rows}
+    else:
+        print("Note: no tuning cross-reference available (main CSV has no S.SterrGtuning/S.SterrBtuning "
+              "columns and no --tuning-csv was given) - falling back to each song's own song.ini tuning.\n")
 
     # Dry Run Execution
     if dry_run:
@@ -68,6 +77,7 @@ def batch_convert(csv_path, base_songs_dir, output_folder, dry_run=False):
 
     success_count = 0
     check_tuning_count = 0
+    string_mismatch_count = 0
     for row in filtered_rows:
         folder_name = row['Folder Name']
         song_folder = os.path.join(base_songs_dir, folder_name)
@@ -78,37 +88,50 @@ def batch_convert(csv_path, base_songs_dir, output_folder, dry_run=False):
             
         print(f"[{success_count + 1}/{total_matches}] Processing folder: {folder_name}")
 
-        guitar_tuning, guitar_check = None, False
-        bass_tuning, bass_check = None, False
-        if has_tuning_columns:
-            guitar_tuning, guitar_check = resolve_tuning(
-                row.get('Guitar Tuning'), row.get('S.SterrGtuning'), None)
-            bass_tuning, bass_check = resolve_tuning(
-                row.get('Bass Tuning'), row.get('S.SterrBtuning'), None)
+        guitar_tuning, guitar_check, guitar_string_mismatch = None, False, False
+        bass_tuning, bass_check, bass_string_mismatch = None, False, False
+        tuning_row = tuning_lookup.get(folder_name) if tuning_lookup else None
+        if tuning_row:
+            guitar_tuning, guitar_check, guitar_string_mismatch = resolve_tuning(
+                tuning_row.get('Guitar Tuning'), tuning_row.get('S.SterrGtuning'), None)
+            bass_tuning, bass_check, bass_string_mismatch = resolve_tuning(
+                tuning_row.get('Bass Tuning'), tuning_row.get('S.SterrBtuning'), None)
             if guitar_check or bass_check:
                 check_tuning_count += 1
+            if guitar_string_mismatch or bass_string_mismatch:
+                string_mismatch_count += 1
 
         try:
             convert_to_feedpak(
                 song_folder, output_folder,
                 guitar_tuning_override=guitar_tuning, guitar_tuning_check=guitar_check,
-                bass_tuning_override=bass_tuning, bass_tuning_check=bass_check
+                guitar_string_mismatch=guitar_string_mismatch,
+                bass_tuning_override=bass_tuning, bass_tuning_check=bass_check,
+                bass_string_mismatch=bass_string_mismatch
             )
             success_count += 1
         except Exception as e:
             print(f"Error converting {folder_name}: {e}")
 
     print(f"\nBatch conversion complete! Successfully processed {success_count} files.")
-    if has_tuning_columns:
+    if tuning_lookup:
         print(f"{check_tuning_count} song(s) flagged '(check tuning)' - RB3 and Songsterr tunings "
               f"disagreed by a non-uniform amount across strings.")
+        print(f"{string_mismatch_count} song(s) flagged '(string count mismatch)' - RB3 and Songsterr "
+              f"tunings had a different number of strings, so Songsterr's was used without comparison.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch convert RB3 songs with Pro Guitar/Keys from CSV.")
-    parser.add_argument("csv_path", help="Path to rb3_songs_db_merged_with_tunings.csv (or rb3_songs_db.csv for song.ini-only tuning)")
+    parser.add_argument("csv_path", help="Path to rb3_songs_db.csv or rb3_songs_db_merged_with_tunings.csv")
     parser.add_argument("base_songs_dir", help="Base directory containing the song folders")
     parser.add_argument("output_folder", help="Directory where .feedpak files will be saved")
     parser.add_argument("--dry-run", action="store_true", help="Preview the songs to be converted without running the conversion")
-    
+    parser.add_argument("--tuning-csv", default=None,
+                         help="Optional separate path to rb3_songs_db_merged_with_tunings.csv, used as a "
+                              "cross-reference lookup table for tuning by folder name. Only used when "
+                              "provided; takes priority over tuning columns already in csv_path, if any. "
+                              "Without either, tuning comes from each song's own song.ini.")
+
     args = parser.parse_args()
-    batch_convert(args.csv_path, args.base_songs_dir, args.output_folder, dry_run=args.dry_run)
+    batch_convert(args.csv_path, args.base_songs_dir, args.output_folder,
+                  dry_run=args.dry_run, tuning_csv_path=args.tuning_csv)
