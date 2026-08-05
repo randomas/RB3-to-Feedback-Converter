@@ -23,7 +23,59 @@ def parse_tuning(value, default):
     return offsets if offsets else default
 
 
-def convert_to_feedpak(song_folder, output_folder):
+def parse_tuning_strict(value):
+    # Like parse_tuning, but returns None instead of a default when the
+    # value is missing/blank/non-numeric ("Unknown" etc.) - resolve_tuning
+    # below needs to tell "no usable data" apart from "a real tuning".
+    if not value:
+        return None
+    value = value.strip().strip('"').strip("'").strip()
+    if not value:
+        return None
+    tokens = [t for t in re.split(r'[,\s]+', value) if t != '']
+    if not tokens:
+        return None
+    try:
+        return [int(t) for t in tokens]
+    except ValueError:
+        return None
+
+
+def resolve_tuning(rb3_tuning_str, songsterr_tuning_str, default):
+    """
+    Reconciles the RB3-declared tuning against a Songsterr-sourced tuning
+    for the same instrument. Returns (tuning, needs_check):
+      - No usable Songsterr value -> fall back to the RB3 tuning (or
+        default), never flagged - there's nothing to disagree with.
+      - Songsterr present but RB3 tuning missing, or the two have a
+        different number of strings (e.g. a 7-string chart Songsterr knows
+        about that the RB3 .ini only ever declared 6 strings for) -> can't
+        meaningfully compare, so trust Songsterr as-is, not flagged.
+      - Both present, same length, and the per-string difference is
+        constant across every string (including all-zero, i.e. identical)
+        -> they're the same tuning (or a uniform transposition of it) ->
+        use Songsterr, not flagged.
+      - Both present, same length, but the per-string difference is NOT
+        constant -> genuinely conflicting tunings -> use Songsterr, but
+        flag it for a human to double check.
+    """
+    rb3 = parse_tuning_strict(rb3_tuning_str)
+    songsterr = parse_tuning_strict(songsterr_tuning_str)
+
+    if songsterr is None:
+        return (rb3 if rb3 is not None else default), False
+
+    if rb3 is None or len(rb3) != len(songsterr):
+        return songsterr, False
+
+    diffs = [s - r for s, r in zip(songsterr, rb3)]
+    needs_check = len(set(diffs)) > 1
+    return songsterr, needs_check
+
+
+def convert_to_feedpak(song_folder, output_folder,
+                        guitar_tuning_override=None, guitar_tuning_check=False,
+                        bass_tuning_override=None, bass_tuning_check=False):
     ini_path = os.path.join(song_folder, 'song.ini')
     if not os.path.exists(ini_path):
         print(f"Error: No song.ini found in {song_folder}")
@@ -48,8 +100,10 @@ def convert_to_feedpak(song_folder, output_folder):
         print(" -> Parsing MIDI track data...")
         generated_jsons = parse_midi_file(midi_path, song_folder)
 
-    guitar_tuning = parse_tuning(meta.get('real_guitar_tuning'), [0, 0, 0, 0, 0, 0])
-    bass_tuning = parse_tuning(meta.get('real_bass_tuning'), [0, 0, 0, 0])
+    guitar_tuning = guitar_tuning_override if guitar_tuning_override is not None \
+        else parse_tuning(meta.get('real_guitar_tuning'), [0, 0, 0, 0, 0, 0])
+    bass_tuning = bass_tuning_override if bass_tuning_override is not None \
+        else parse_tuning(meta.get('real_bass_tuning'), [0, 0, 0, 0])
 
     arrangements = []
     if 'combo.json' in generated_jsons:
@@ -109,10 +163,14 @@ def convert_to_feedpak(song_folder, output_folder):
             cover_file = file
 
     duration_ms = float(meta.get('song_length', 0))
-    
+
+    display_title = song_name
+    if guitar_tuning_check or bass_tuning_check:
+        display_title = f"{song_name} (check tuning)"
+
     manifest = {
         "feedpak_version": "1.19.0",
-        "title": song_name,
+        "title": display_title,
         "artist": artist,
         "album": meta.get('album', ''),
         "year": int(meta['year']) if meta.get('year') and meta['year'].isdigit() else None,
